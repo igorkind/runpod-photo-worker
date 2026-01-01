@@ -1,0 +1,10 @@
+runpod
+numpy<2.0
+diffusers==0.24.0
+accelerate==0.26.0
+transformers==4.36.2
+huggingface_hub==0.20.3
+safetensors
+pillow
+requests
+opencv-python
