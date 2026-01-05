@@ -9,7 +9,7 @@ from PIL import Image
 from diffusers import StableDiffusionXLInpaintPipeline
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 
-# Global variables for caching models (Cold Start optimization)
+#  Global variables for caching models (Cold Start optimization)
 pipe = None
 processor = None
 segmentator = None
