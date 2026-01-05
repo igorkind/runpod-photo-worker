@@ -8,3 +8,4 @@ safetensors
 pillow
 requests
 opencv-python
+omegaconf

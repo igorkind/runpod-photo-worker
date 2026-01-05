@@ -146,7 +146,7 @@ def handler(event):
         result_image.save(buffered, format="PNG")
         img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
         
-        return {"image_base64": img_str}
+        return img_str
         
     except Exception as e:
         print(f"Error: {e}")
