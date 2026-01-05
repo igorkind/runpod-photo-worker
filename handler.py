@@ -26,7 +26,7 @@ def init_handler():
     segmentator = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined").to(device)
 
     # Load SDXL Inpainting from Custom Checkpoint
-    checkpoint_path = "checkpoints/Biglove2.safetensors"
+    checkpoint_path = "./checkpoints/Biglove2.safetensors"
     print(f"Loading SDXL Pipeline from {checkpoint_path}...")
     
     pipe = StableDiffusionXLInpaintPipeline.from_single_file(

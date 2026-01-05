@@ -19,7 +19,9 @@ COPY builder.py .
 COPY handler.py .
 
 # Run builder to download models
-RUN python builder.py
+RUN python builder.py && \
+    rm -rf /root/.cache/huggingface/hub && \
+    rm -rf /root/.cache/pip
 
 # Command to run the handler
 CMD [ "python", "-u", "handler.py" ]
