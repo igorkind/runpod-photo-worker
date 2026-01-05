@@ -22,7 +22,7 @@ def build():
     # without loading the huge fp32 model into RAM.
     snapshot_download(
         repo_id="diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
-        allow_patterns=["*.json", "*.fp16.safetensors", "*.safetensors", "*.txt", "*.model"]
+        allow_patterns=["*.json", "*.txt"]  # <--- ТОЛЬКО КОНФИГИ!
     )
 
     # 3. Download Custom Checkpoint
