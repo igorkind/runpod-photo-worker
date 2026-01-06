@@ -10,11 +10,10 @@ import traceback
 import diffusers
 import transformers
 
-# Логируем версии при старте для отладки
+# Логируем версии при старте
 print(f"DEBUG: Script started. Diffusers: {diffusers.__version__}, Transformers: {transformers.__version__}", file=sys.stderr)
 
 from PIL import Image
-# Используем конкретный класс вместо AutoPipeline
 from diffusers import StableDiffusionXLInpaintPipeline
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 
@@ -39,12 +38,14 @@ def init_handler():
         checkpoint_path = "./checkpoints/Biglove2.safetensors"
         print(f"Loading SDXL Inpainting from {checkpoint_path}...")
         
-        # Используем конкретный класс для SDXL
+        # ИСПРАВЛЕНИЕ ЗДЕСЬ: Добавили ignore_mismatched_sizes=True
         pipe_inpaint = StableDiffusionXLInpaintPipeline.from_single_file(
             checkpoint_path,
             torch_dtype=torch.float16,
             use_safetensors=True,
-            variant="fp16"
+            variant="fp16",
+            ignore_mismatched_sizes=True, # <--- РАЗРЕШАЕМ ЗАГРУЗКУ ОБЫЧНОЙ МОДЕЛИ
+            low_cpu_mem_usage=False       # <--- ОТКЛЮЧАЕМ ОПТИМИЗАЦИЮ RAM РАДИ СТАБИЛЬНОСТИ
         ).to(device)
         
         print("✅ Initialization complete (Inpainting Mode).")
