@@ -10,11 +10,11 @@ import traceback
 import diffusers
 import transformers
 
-# Лог для подтверждения обновления версии кода
-print(f"DEBUG: Script started v1.13. Diffusers: {diffusers.__version__}", file=sys.stderr)
+# Лог для проверки версии
+print(f"DEBUG: Script started. Diffusers: {diffusers.__version__}", file=sys.stderr)
 
 from PIL import Image
-# Используем AutoPipeline - он самый надежный для кастомных моделей
+# Используем AutoPipeline - он автоматически адаптирует обычную модель под Inpainting
 from diffusers import AutoPipelineForInpainting
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 
@@ -39,16 +39,15 @@ def init_handler():
         checkpoint_path = "./checkpoints/Biglove2.safetensors"
         print(f"Loading SDXL Inpainting from {checkpoint_path}...")
         
-        # Используем AutoPipelineForInpainting
-        # Он автоматически сконвертирует веса 4-канальной модели в 9-канальную
+        # ИСПОЛЬЗУЕМ AutoPipelineForInpainting
         pipe_inpaint = AutoPipelineForInpainting.from_single_file(
             checkpoint_path,
             torch_dtype=torch.float16,
-            # Убрали variant="fp16", так как он часто ломает конвертацию весов
-            # variant="fp16", 
             use_safetensors=True,
+            # ВАЖНО: Убрали variant="fp16", так как он мешает конвертации весов
+            # variant="fp16", 
             
-            # КРИТИЧЕСКИ ВАЖНЫЕ ФЛАГИ ДЛЯ ЗАГРУЗКИ ОБЫЧНОЙ МОДЕЛИ В INPAINTING:
+            # Разрешаем загрузку обычной модели (4 канала) в Inpainting (9 каналов)
             ignore_mismatched_sizes=True, 
             low_cpu_mem_usage=False
         ).to(device)
