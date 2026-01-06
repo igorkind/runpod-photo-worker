@@ -102,8 +102,13 @@ def download_image(url):
 def handler(event):
     global pipe_inpaint, pipe_t2i
     
+    # 1. Получаем ID задачи (для логов и ответа)
+    job_id = event.get("id", "local_test")
+    print(f"🎬 Starting job: {job_id}")
+
+    # Если инициализация упала
     if pipe_inpaint is None:
-        init_handler()
+        return {"status": "failed", "job_id": job_id, "error": "Model not initialized"}
 
     job_input = event["input"]
     image_url = job_input.get("image_url")
@@ -111,7 +116,7 @@ def handler(event):
     negative_prompt = job_input.get("negative_prompt", "blurry, low quality, distortion")
     
     if not prompt:
-        return {"error": "Missing prompt"}
+        return {"status": "failed", "job_id": job_id, "error": "Missing prompt"}
 
     try:
         generator = None
@@ -158,15 +163,28 @@ def handler(event):
                 generator=generator
             ).images
         
-        # Возврат Base64
+        # Возврат результата
         buffered = io.BytesIO()
         output_images[0].save(buffered, format="JPEG", quality=95)
-        return base64.b64encode(buffered.getvalue()).decode("utf-8")
+        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        
+        # Возвращаем структурированный ответ с ID
+        print(f"✅ Job {job_id} completed successfully.")
+        return {
+            "status": "success",
+            "job_id": job_id,
+            "image": img_str
+        }
         
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error in job {job_id}: {e}")
         traceback.print_exc()
-        return {"error": str(e)}
+        # Возвращаем ошибку с ID
+        return {
+            "status": "failed",
+            "job_id": job_id,
+            "error": str(e)
+        }
 
 init_handler()
 runpod.serverless.start({"handler": handler})
