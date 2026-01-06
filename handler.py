@@ -1,7 +1,4 @@
 import sys
-# Debug-маячок для логов
-print("DEBUG: Script started...", file=sys.stderr)
-
 import runpod
 import torch
 import requests
@@ -14,7 +11,10 @@ from PIL import Image
 from diffusers import AutoPipelineForInpainting
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 
-# Глобальные переменные
+# Логирование старта
+print("DEBUG: Script started...", file=sys.stderr)
+
+# Глобальные переменные (Кэшируем модели в памяти)
 pipe_inpaint = None
 processor = None
 segmentator = None
@@ -26,12 +26,12 @@ def init_handler():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"🚀 Initializing handler on {device}...")
 
-        # 1. Загрузка ClipSeg (для масок)
+        # 1. ClipSeg (Создание маски)
         print("Loading ClipSeg...")
         processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
         segmentator = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined").to(device)
 
-        # 2. Загрузка SDXL Inpainting
+        # 2. SDXL Inpainting (Основная модель)
         checkpoint_path = "./checkpoints/Biglove2.safetensors"
         print(f"Loading SDXL Inpainting from {checkpoint_path}...")
         
@@ -40,19 +40,23 @@ def init_handler():
             torch_dtype=torch.float16,
             use_safetensors=True,
             variant="fp16"
-        ).to(device)
+        ).to(device) # Грузим сразу в VRAM для скорости
         
-        print("✅ Initialization complete (Inpainting only).")
+        # Опционально: включить xformers если есть, но torch 2.0+ и так быстр
+        # pipe_inpaint.enable_xformers_memory_efficient_attention()
+        
+        print("✅ Initialization complete (Inpainting Mode).")
         
     except Exception as e:
         print(f"🔥 CRITICAL ERROR during init: {e}")
         traceback.print_exc()
+        # Задержка, чтобы успеть прочитать логи в RunPod перед рестартом
         import time
         time.sleep(10)
         raise e
 
 def smart_resize(image, max_side=1024):
-    """Ресайз с сохранением пропорций, кратный 8."""
+    """Ресайз с сохранением пропорций, кратный 8 (для VAE)."""
     width, height = image.size
     if max(width, height) > max_side:
         scale = max_side / max(width, height)
@@ -67,7 +71,7 @@ def smart_resize(image, max_side=1024):
     return image.resize((new_width, new_height), Image.LANCZOS)
 
 def get_mask(image, text_prompts):
-    """Генерация маски через ClipSeg."""
+    """Генерация маски одежды через ClipSeg."""
     device = segmentator.device
     prompts = [p.strip() for p in text_prompts.split(",")]
         
@@ -83,6 +87,8 @@ def get_mask(image, text_prompts):
 
     mask_np = combined_mask.cpu().numpy()
     mask_cv = cv2.resize(mask_np, image.size, interpolation=cv2.INTER_CUBIC)
+    
+    # Порог 0.3 - оптимально для одежды
     _, binary_mask = cv2.threshold(mask_cv, 0.3, 255, cv2.THRESH_BINARY)
     return Image.fromarray(binary_mask.astype(np.uint8))
 
@@ -103,28 +109,30 @@ def handler(event):
     job_input = event["input"]
     image_url = job_input.get("image_url")
     prompt = job_input.get("prompt")
-    negative_prompt = job_input.get("negative_prompt", "blurry, low quality, distortion")
+    negative_prompt = job_input.get("negative_prompt", "blurry, low quality, distortion, ugly, deformed")
     
-    # ТЕПЕРЬ СТРОГО ТРЕБУЕМ IMAGE_URL
+    # Валидация
     if not image_url:
-        return {"status": "failed", "job_id": job_id, "error": "image_url is required for inpainting worker"}
-
+        return {"status": "failed", "job_id": job_id, "error": "image_url is required"}
     if not prompt:
-        return {"status": "failed", "job_id": job_id, "error": "Missing prompt"}
+        return {"status": "failed", "job_id": job_id, "error": "prompt is required"}
 
     try:
         generator = None
         if "seed" in job_input:
              generator = torch.Generator(device="cuda").manual_seed(job_input["seed"])
 
-        print(f"🎨 Mode: Inpainting for {image_url}")
+        print(f"🎨 Processing image: {image_url}")
         mask_target = job_input.get("mask_target", "clothes, dress, suit, tshirt")
         
+        # 1. Загрузка и ресайз
         original_image = download_image(image_url)
         processing_image = smart_resize(original_image)
         
+        # 2. Маска
         mask_image = get_mask(processing_image, mask_target)
         
+        # 3. Генерация (Inpainting)
         output_images = pipe_inpaint(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -134,19 +142,20 @@ def handler(event):
             width=processing_image.width,
             num_inference_steps=job_input.get("steps", 30),
             guidance_scale=job_input.get("guidance_scale", 7.5),
-            strength=job_input.get("strength", 0.99),
+            strength=job_input.get("strength", 0.99), # Полная замена под маской
             generator=generator
         ).images
 
+        # 4. Кодирование результата
         buffered = io.BytesIO()
         output_images[0].save(buffered, format="JPEG", quality=95)
         img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
         
-        print(f"✅ Job {job_id} completed successfully.")
+        print(f"✅ Job {job_id} success.")
         return {
             "status": "success",
             "job_id": job_id,
-            "image": img_str
+            "image": img_str # Чистый base64, как ждет клиент
         }
         
     except Exception as e:
@@ -158,5 +167,6 @@ def handler(event):
             "error": str(e)
         }
 
+# Инициализация при старте контейнера
 init_handler()
 runpod.serverless.start({"handler": handler})

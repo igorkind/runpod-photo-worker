@@ -1,6 +1,6 @@
 runpod>=1.6.0
 numpy<2.0
-# Стабильная версия diffusers (точно содержит AutoPipelineForTextToImage)
+# Стабильная связка для SDXL
 diffusers==0.27.2
 accelerate==0.29.3
 transformers==4.39.3
