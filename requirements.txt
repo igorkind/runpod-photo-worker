@@ -1,8 +1,8 @@
 runpod>=1.6.0
 numpy<2.0
-diffusers>=0.29.0
-accelerate>=0.31.0
-transformers>=4.41.0
+diffusers==0.27.2
+accelerate==0.29.3
+transformers==4.39.3
 huggingface_hub>=0.23.0
 safetensors
 pillow
