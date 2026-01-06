@@ -10,11 +10,12 @@ import traceback
 import diffusers
 import transformers
 
-# Логируем версии при старте
-print(f"DEBUG: Script started. Diffusers: {diffusers.__version__}, Transformers: {transformers.__version__}", file=sys.stderr)
+# Лог для подтверждения обновления версии кода
+print(f"DEBUG: Script started v1.13. Diffusers: {diffusers.__version__}", file=sys.stderr)
 
 from PIL import Image
-from diffusers import StableDiffusionXLInpaintPipeline
+# Используем AutoPipeline - он самый надежный для кастомных моделей
+from diffusers import AutoPipelineForInpainting
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 
 # Глобальные переменные
@@ -38,14 +39,18 @@ def init_handler():
         checkpoint_path = "./checkpoints/Biglove2.safetensors"
         print(f"Loading SDXL Inpainting from {checkpoint_path}...")
         
-        # ИСПРАВЛЕНИЕ ЗДЕСЬ: Добавили ignore_mismatched_sizes=True
-        pipe_inpaint = StableDiffusionXLInpaintPipeline.from_single_file(
+        # Используем AutoPipelineForInpainting
+        # Он автоматически сконвертирует веса 4-канальной модели в 9-канальную
+        pipe_inpaint = AutoPipelineForInpainting.from_single_file(
             checkpoint_path,
             torch_dtype=torch.float16,
+            # Убрали variant="fp16", так как он часто ломает конвертацию весов
+            # variant="fp16", 
             use_safetensors=True,
-            variant="fp16",
-            ignore_mismatched_sizes=True, # <--- РАЗРЕШАЕМ ЗАГРУЗКУ ОБЫЧНОЙ МОДЕЛИ
-            low_cpu_mem_usage=False       # <--- ОТКЛЮЧАЕМ ОПТИМИЗАЦИЮ RAM РАДИ СТАБИЛЬНОСТИ
+            
+            # КРИТИЧЕСКИ ВАЖНЫЕ ФЛАГИ ДЛЯ ЗАГРУЗКИ ОБЫЧНОЙ МОДЕЛИ В INPAINTING:
+            ignore_mismatched_sizes=True, 
+            low_cpu_mem_usage=False
         ).to(device)
         
         print("✅ Initialization complete (Inpainting Mode).")
