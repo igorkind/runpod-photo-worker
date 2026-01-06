@@ -1,3 +1,7 @@
+import sys
+# Debug-маячок для логов
+print("DEBUG: Script started...", file=sys.stderr)
+
 import runpod
 import torch
 import requests
@@ -28,29 +32,29 @@ def init_handler():
         processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
         segmentator = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined").to(device)
 
-        # 2. Загрузка SDXL Inpainting
+        # 2. Загрузка SDXL Inpainting (из твоего чекпоинта)
         checkpoint_path = "./checkpoints/Biglove2.safetensors"
         print(f"Loading SDXL from {checkpoint_path}...")
         
+        # Загружаем Inpainting pipeline
         pipe_inpaint = AutoPipelineForInpainting.from_single_file(
             checkpoint_path,
             torch_dtype=torch.float16,
             use_safetensors=True,
             variant="fp16"
-        ).to(device) # Загружаем сразу в VRAM (хватит 24ГБ)
+        ).to(device)
         
         # 3. Создаем T2I пайплайн из первого (общая память)
-        print("Creating Text-to-Image Pipeline...")
+        print("Creating Text-to-Image Pipeline from shared weights...")
         pipe_t2i = AutoPipelineForTextToImage.from_pipe(pipe_inpaint)
         
-        print("✅ Initialization complete. Waiting for jobs...")
+        print("✅ Initialization complete.")
         
     except Exception as e:
         print(f"🔥 CRITICAL ERROR during init: {e}")
         traceback.print_exc()
-        # Не даем контейнеру упасть сразу, чтобы успеть прочитать логи
         import time
-        time.sleep(10)
+        time.sleep(10) # Даем время прочитать логи перед падением
         raise e
 
 def smart_resize(image, max_side=1024):
@@ -63,22 +67,16 @@ def smart_resize(image, max_side=1024):
     else:
         new_width, new_height = width, height
         
+    # Округляем до кратного 8 (требование VAE)
     new_width = (new_width // 8) * 8
     new_height = (new_height // 8) * 8
     
-    # Защита от слишком маленьких картинок
-    new_width = max(8, new_width)
-    new_height = max(8, new_height)
-
     return image.resize((new_width, new_height), Image.LANCZOS)
 
 def get_mask(image, text_prompts):
     """Генерация маски через ClipSeg."""
     device = segmentator.device
-    if isinstance(text_prompts, str):
-        prompts = [p.strip() for p in text_prompts.split(",")]
-    else:
-        prompts = text_prompts
+    prompts = [p.strip() for p in text_prompts.split(",")]
         
     inputs = processor(text=prompts, images=[image] * len(prompts), padding="max_length", return_tensors="pt").to(device)
     
@@ -92,6 +90,7 @@ def get_mask(image, text_prompts):
 
     mask_np = combined_mask.cpu().numpy()
     mask_cv = cv2.resize(mask_np, image.size, interpolation=cv2.INTER_CUBIC)
+    # Порог 0.3 для лучшего захвата одежды
     _, binary_mask = cv2.threshold(mask_cv, 0.3, 255, cv2.THRESH_BINARY)
     return Image.fromarray(binary_mask.astype(np.uint8))
 
@@ -103,9 +102,8 @@ def download_image(url):
 def handler(event):
     global pipe_inpaint, pipe_t2i
     
-    # Если инициализация упала, job_input может не существовать
     if pipe_inpaint is None:
-        return {"error": "Model not initialized"}
+        init_handler()
 
     job_input = event["input"]
     image_url = job_input.get("image_url")
@@ -120,15 +118,14 @@ def handler(event):
         if "seed" in job_input:
              generator = torch.Generator(device="cuda").manual_seed(job_input["seed"])
 
-        # СЦЕНАРИЙ 1: Inpainting (есть фото)
+        # СЦЕНАРИЙ 1: Inpainting (есть ссылка на фото)
         if image_url:
             print(f"🎨 Mode: Inpainting for {image_url}")
-            mask_target = job_input.get("mask_target", "clothes, shirt, pants, dress")
+            mask_target = job_input.get("mask_target", "clothes, dress, suit, tshirt")
             
             original_image = download_image(image_url)
+            # Умный ресайз (сохраняет 9:16 и качество)
             processing_image = smart_resize(original_image)
-            
-            print(f"Resize: {original_image.size} -> {processing_image.size}")
             
             mask_image = get_mask(processing_image, mask_target)
             
@@ -141,15 +138,15 @@ def handler(event):
                 width=processing_image.width,
                 num_inference_steps=job_input.get("steps", 30),
                 guidance_scale=job_input.get("guidance_scale", 7.5),
-                strength=job_input.get("strength", 0.99),
+                strength=job_input.get("strength", 0.99), # Высокая сила для полной замены
                 generator=generator
             ).images
 
         # СЦЕНАРИЙ 2: Text-to-Image (нет фото)
         else:
             print("✨ Mode: Text-to-Image")
-            width = job_input.get("width", 1024)
-            height = job_input.get("height", 1024)
+            width = job_input.get("width", 832)  # По умолчанию портрет
+            height = job_input.get("height", 1216)
             
             output_images = pipe_t2i(
                 prompt=prompt,
@@ -161,16 +158,15 @@ def handler(event):
                 generator=generator
             ).images
         
-        # Возврат результата
+        # Возврат Base64
         buffered = io.BytesIO()
-        output_images[0].save(buffered, format="PNG")
+        output_images[0].save(buffered, format="JPEG", quality=95)
         return base64.b64encode(buffered.getvalue()).decode("utf-8")
         
     except Exception as e:
-        print(f"❌ Error during generation: {e}")
+        print(f"❌ Error: {e}")
         traceback.print_exc()
         return {"error": str(e)}
 
-# Запуск
 init_handler()
 runpod.serverless.start({"handler": handler})

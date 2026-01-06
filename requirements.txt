@@ -1,11 +1,12 @@
-runpod
+runpod>=1.6.0
 numpy<2.0
-diffusers>=0.27.0
-accelerate>=0.28.0
-transformers>=4.39.0
-huggingface_hub>=0.22.0
+diffusers>=0.29.0
+accelerate>=0.31.0
+transformers>=4.41.0
+huggingface_hub>=0.23.0
 safetensors
 pillow
 requests
 opencv-python
 omegaconf
+protobuf

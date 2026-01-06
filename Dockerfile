@@ -1,7 +1,6 @@
 # ИСПОЛЬЗУЕМ БОЛЕЕ НОВЫЙ ОБРАЗ (PyTorch 2.2 + CUDA 12.1)
 FROM runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04
 
-# Устанавливаем рабочую директорию
 WORKDIR /app
 
 # Системные зависимости
@@ -18,12 +17,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY builder.py .
 COPY handler.py .
 
-# Запускаем builder (качаем модели) и чистим кэш pip
-# (Кэш huggingface оставляем, чтобы ускорить запуск)
-# Run builder to download models
+# Запускаем builder и удаляем ТОЛЬКО кэш pip. Кэш моделей оставляем!
 RUN python builder.py && \
-    rm -rf /root/.cache/huggingface/hub && \
     rm -rf /root/.cache/pip
 
-# Запуск
 CMD [ "python", "-u", "handler.py" ]
