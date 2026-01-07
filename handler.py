@@ -10,16 +10,15 @@ import traceback
 import diffusers
 import transformers
 
-print(f"DEBUG: Script started. Diffusers: {diffusers.__version__}", file=sys.stderr)
+print(f"DEBUG: Script v1.16 (Quality Boost). Diffusers: {diffusers.__version__}", file=sys.stderr)
 
 from PIL import Image
-# Импортируем конкретные классы для стабильности
-from diffusers import StableDiffusionXLInpaintPipeline, StableDiffusionXLImg2ImgPipeline
+from diffusers import StableDiffusionXLInpaintPipeline, StableDiffusionXLImg2ImgPipeline, DPMSolverMultistepScheduler
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 
 # Глобальные переменные
-pipe_base = None   # Официальный Inpainting
-pipe_style = None  # Big Love
+pipe_base = None
+pipe_style = None
 processor = None
 segmentator = None
 
@@ -31,54 +30,68 @@ def init_handler():
         print(f"🚀 Initializing handler on {device}...")
 
         # 1. ClipSeg
-        print("Loading ClipSeg...")
         processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
         segmentator = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined").to(device)
 
-        # 2. Загружаем БАЗУ (Официальный Inpainting)
-        print("Loading Base Inpainting Model (Official)...")
+        # 2. Base Inpainting
+        print("Loading Base Model...")
         pipe_base = StableDiffusionXLInpaintPipeline.from_pretrained(
             "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
             torch_dtype=torch.float16,
             variant="fp16",
             use_safetensors=True
         ).to(device)
-
-        # 3. Загружаем СТИЛЬ (Big Love) как Img2Img
-        checkpoint_path = "./checkpoints/Biglove2.safetensors"
-        print(f"Loading Style Model (Big Love) from {checkpoint_path}...")
         
+        # 🔥 ВАЖНО: Ставим DPM++ 2M Karras Scheduler (Для четкости)
+        pipe_base.scheduler = DPMSolverMultistepScheduler.from_config(
+            pipe_base.scheduler.config, use_karras_sigmas=True
+        )
+
+        # 3. Big Love (Style)
+        print("Loading Style Model...")
         pipe_style = StableDiffusionXLImg2ImgPipeline.from_single_file(
-            checkpoint_path,
+            "./checkpoints/Biglove2.safetensors",
             torch_dtype=torch.float16,
             use_safetensors=True
-            # Здесь не нужны флаги ignore_mismatched, так как мы грузим её в родной Img2Img
         ).to(device)
         
-        # Соединяем компоненты, чтобы сэкономить память (опционально)
-        # pipe_style.text_encoder = pipe_base.text_encoder
-        # pipe_style.text_encoder_2 = pipe_base.text_encoder_2
-        # pipe_style.vae = pipe_base.vae
+        # Тоже ставим DPM++ Scheduler
+        pipe_style.scheduler = DPMSolverMultistepScheduler.from_config(
+            pipe_style.scheduler.config, use_karras_sigmas=True
+        )
         
-        print("✅ Initialization complete (Dual Model Mode).")
+        print("✅ Initialization complete (High Quality Mode).")
         
     except Exception as e:
-        print(f"🔥 CRITICAL ERROR during init: {e}")
+        print(f"🔥 CRITICAL ERROR: {e}")
         traceback.print_exc()
         import time
         time.sleep(10)
         raise e
 
-def smart_resize(image, max_side=1024):
+def smart_resize(image, target_size=1024):
+    """
+    Умный ресайз: 
+    1. Если фото маленькое -> увеличивает (Upscale) до ~1024 по большей стороне.
+    2. Если фото огромное -> уменьшает до 1024.
+    3. Делает стороны кратными 8.
+    """
     width, height = image.size
-    if max(width, height) > max_side:
-        scale = max_side / max(width, height)
-        new_width = int(width * scale)
-        new_height = int(height * scale)
+    aspect_ratio = width / height
+    
+    # Определяем новую ширину и высоту, стремясь к target_size
+    if width > height:
+        new_width = target_size
+        new_height = int(target_size / aspect_ratio)
     else:
-        new_width, new_height = width, height
+        new_height = target_size
+        new_width = int(target_size * aspect_ratio)
+        
+    # Округляем до 8
     new_width = (new_width // 8) * 8
     new_height = (new_height // 8) * 8
+    
+    # Используем LANCZOS для качественного изменения размера
     return image.resize((new_width, new_height), Image.LANCZOS)
 
 def get_mask(image, text_prompts):
@@ -107,14 +120,11 @@ def handler(event):
     job_id = event.get("id", "local_test")
     print(f"🎬 Starting job: {job_id}")
 
-    if pipe_base is None or pipe_style is None:
-        return {"status": "failed", "error": "Models not initialized"}
-
     job_input = event["input"]
     image_url = job_input.get("image_url")
     prompt = job_input.get("prompt")
-    negative_prompt = job_input.get("negative_prompt", "blurry, low quality, distortion")
-    mask_target = job_input.get("mask_target", "clothes, dress, suit, tshirt")
+    # Добавляем "проверенные" негативные промпты для Big Love
+    negative_prompt = job_input.get("negative_prompt", "drawing, painting, illustration, render, 3d, cartoon, anime, low quality, blurry, deformed, ugly, bad anatomy, bad hands, text, watermark")
     
     if not image_url or not prompt:
         return {"status": "failed", "error": "Missing input"}
@@ -126,14 +136,16 @@ def handler(event):
 
         print(f"🎨 Processing: {image_url}")
         
-        # 1. Подготовка
+        # 1. Подготовка и Upscaling
         original_image = download_image(image_url)
-        processing_image = smart_resize(original_image)
+        processing_image = smart_resize(original_image, target_size=1024) # <-- Форсируем 1024px
+        print(f"📏 Resized to: {processing_image.size}")
+        
+        mask_target = job_input.get("mask_target", "clothes, dress, suit, tshirt, swimsuit, lingerie, underwear, bra, panties")
         mask_image = get_mask(processing_image, mask_target)
         
-        # 2. ЭТАП 1: Inpainting (Base Model)
-        # Закрашиваем структуру
-        print("🔹 Stage 1: Base Inpainting...")
+        # 2. ЭТАП 1: Base Inpainting (Структура)
+        print("🔹 Stage 1: Base Structure...")
         inpainted_image = pipe_base(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -141,36 +153,29 @@ def handler(event):
             mask_image=mask_image,
             height=processing_image.height,
             width=processing_image.width,
-            num_inference_steps=20, # Быстрый проход
-            guidance_scale=7.5,
-            strength=0.99, # Полная замена
+            num_inference_steps=25,  # Больше шагов для качества
+            guidance_scale=5.0,      # <-- Снижаем CFG для реализма (было 7.5)
+            strength=0.99,
             generator=generator
         ).images[0]
         
-        # 3. ЭТАП 2: Refiner (Big Love)
-        # Улучшаем стиль и детали
-        print("🔸 Stage 2: Big Love Styling...")
+        # 3. ЭТАП 2: Refiner Big Love (Детали)
+        print("🔸 Stage 2: Big Love Finish...")
         final_image = pipe_style(
-            prompt=prompt,
+            prompt=prompt, # Тот же промпт
             negative_prompt=negative_prompt,
-            image=inpainted_image, # Берем результат первого этапа
+            image=inpainted_image,
             num_inference_steps=25,
-            strength=0.35, # <--- Важно! Меняем только 35% пикселей (стилизация), сохраняя структуру
-            guidance_scale=7.5,
+            strength=0.50,       # Чуть сильнее перерисовываем (было 0.35)
+            guidance_scale=5.0,  # <-- Тоже 5.0
             generator=generator
         ).images[0]
 
-        # 4. Результат
         buffered = io.BytesIO()
         final_image.save(buffered, format="JPEG", quality=95)
         img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
         
-        print(f"✅ Job {job_id} success.")
-        return {
-            "status": "success",
-            "job_id": job_id,
-            "image": img_str
-        }
+        return {"status": "success", "image": img_str}
         
     except Exception as e:
         print(f"❌ Error: {e}")
