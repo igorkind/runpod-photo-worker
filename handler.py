@@ -10,7 +10,7 @@ import traceback
 import diffusers
 import transformers
 
-print(f"DEBUG: Script v3.6 (Debug Stages + 10% Fallback). Diffusers: {diffusers.__version__}", file=sys.stderr)
+print(f"DEBUG: Script v3.8 (Fully Dynamic Config). Diffusers: {diffusers.__version__}", file=sys.stderr)
 
 from PIL import Image, ImageFilter
 from diffusers import StableDiffusionXLInpaintPipeline, StableDiffusionXLImg2ImgPipeline, DPMSolverMultistepScheduler
@@ -33,15 +33,13 @@ def init_handler():
         processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
         segmentator = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined").to(device)
 
-        # 2. Base Inpainting (Juggernaut)
-        print(f"Loading Base Model ({CHECKPOINT_FILE})...")
-        checkpoint_path = f"./checkpoints/{CHECKPOINT_FILE}"
-        
-        pipe_base = StableDiffusionXLInpaintPipeline.from_single_file(
-            checkpoint_path,
+        # 2. Base Inpainting (Официальная модель)
+        print("Loading Base Model (Official Inpainting)...")
+        pipe_base = StableDiffusionXLInpaintPipeline.from_pretrained(
+            "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
             torch_dtype=torch.float16,
+            variant="fp16",
             use_safetensors=True,
-            ignore_mismatched_sizes=True,
             safety_checker=None, 
             requires_safety_checker=False
         ).to(device)
@@ -50,8 +48,10 @@ def init_handler():
             pipe_base.scheduler.config, use_karras_sigmas=True, algorithm_type="sde-dpmsolver++"
         )
 
-        # 3. Refiner
-        print("Loading Refiner...")
+        # 3. Refiner (Juggernaut)
+        print(f"Loading Refiner ({CHECKPOINT_FILE})...")
+        checkpoint_path = f"./checkpoints/{CHECKPOINT_FILE}"
+        
         pipe_style = StableDiffusionXLImg2ImgPipeline.from_single_file(
             checkpoint_path,
             torch_dtype=torch.float16,
@@ -74,6 +74,8 @@ def init_handler():
         try:
             pipe_base.load_lora_weights(lora_path)
             pipe_base.fuse_lora(lora_scale=0.5)
+            pipe_style.load_lora_weights(lora_path)
+            pipe_style.fuse_lora(lora_scale=0.5)
             print("✅ LoRA fused.")
         except Exception:
             print("⚠️ LoRA skipped.")
@@ -145,18 +147,28 @@ def handler(event):
     job_input = event["input"]
     
     try:
+        # --- 1. ПАРСИНГ ПАРАМЕТРОВ ---
         image_url = job_input.get("image_url")
         user_prompt = job_input.get("prompt", "")
-        # Используем дефолт, если не передано
-        mask_target_str = job_input.get("mask_target", "clothes, dress, suit, tshirt, outfit, jacket, coat, underwear, swimsuit, underpants")
         
-        # Сильный промпт
-        prompt = f"({user_prompt})++, professional photo, realistic, 8k, highly detailed, soft lighting"
+        # Динамические настройки с дефолтами
+        mask_target_str = job_input.get("mask_target", "clothes, dress, suit, tshirt, outfit, jacket, coat, underwear, swimsuit, underpants")
+        mask_exclude_str = job_input.get("mask_exclude", "face, head, hands")
+        mask_blur_radius = int(job_input.get("mask_blur", 15))
+        
+        steps_base = int(job_input.get("steps_base", 20))
+        steps_refiner = int(job_input.get("steps_refiner", 25))
+        strength_refiner = float(job_input.get("strength_refiner", 0.40))
+        guidance_scale = float(job_input.get("guidance_scale", 7.0))
+        
         negative_prompt = job_input.get("negative_prompt", "blurry, low quality, distorted face, ugly hands, cartoon, 3d render")
+        
+        # Формируем полный промпт (можно также передать use_raw_prompt=True, если не хотим добавлять суффиксы)
+        prompt = f"({user_prompt})++, professional photo, realistic, 8k, highly detailed, soft lighting"
         
         generator = torch.Generator(device="cuda").manual_seed(job_input.get("seed", 42))
         
-        # 1. Загрузка
+        # --- 2. ЗАГРУЗКА И МАСКИРОВАНИЕ ---
         if not image_url:
             # T2I режим
             processing_image = Image.new("RGB", (832, 1216), (0,0,0))
@@ -166,12 +178,12 @@ def handler(event):
             original_image = download_image(image_url)
             processing_image = smart_resize(original_image, target_size=1024)
             
-            # 2. Маска (Основная)
             targets = [t.strip() for t in mask_target_str.split(",")]
-            # Лицо бережем
-            excludes = ["face", "head", "hands"]
+            excludes = [t.strip() for t in mask_exclude_str.split(",")]
             
-            print(f"🎭 Generating mask for: {targets}")
+            print(f"🎭 Mask Targets: {targets}")
+            print(f"🛡️ Mask Excludes: {excludes}")
+            
             mask_tensor = get_mask_tensor(processing_image, targets, excludes)
             mask_image, coverage = process_mask_from_tensor(mask_tensor, processing_image.size)
             print(f"📊 Coverage: {coverage:.2%}")
@@ -182,10 +194,12 @@ def handler(event):
                 mask_tensor = get_mask_tensor(processing_image, ["person", "body"], ["face"])
                 mask_image, coverage = process_mask_from_tensor(mask_tensor, processing_image.size)
 
-        mask_blurred = mask_image.filter(ImageFilter.GaussianBlur(radius=15))
+        mask_blurred = mask_image.filter(ImageFilter.GaussianBlur(radius=mask_blur_radius))
 
-        # 3. Stage 1
-        print("🔹 Stage 1: Base Inpainting...")
+        # --- 3. ГЕНЕРАЦИЯ ---
+        
+        # Stage 1: Base
+        print(f"🔹 Stage 1: Steps={steps_base}, CFG={guidance_scale}...")
         inpainted_image = pipe_base(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -193,32 +207,31 @@ def handler(event):
             mask_image=mask_image, 
             height=processing_image.height,
             width=processing_image.width,
-            num_inference_steps=25,
-            guidance_scale=7.0,
-            strength=1.0, # Полная замена
+            num_inference_steps=steps_base,
+            guidance_scale=guidance_scale,
+            strength=0.99 if image_url else 1.0,
             generator=generator
         ).images[0]
         
-        # 4. Stage 2
-        print("🔸 Stage 2: Refiner...")
+        # Stage 2: Refiner
+        print(f"🔸 Stage 2: Steps={steps_refiner}, Strength={strength_refiner}...")
         style_image = pipe_style(
             prompt=prompt,
             negative_prompt=negative_prompt,
             image=inpainted_image,
-            num_inference_steps=25,
-            strength=0.35, 
-            guidance_scale=7.0,
+            num_inference_steps=steps_refiner,
+            strength=strength_refiner, 
+            guidance_scale=guidance_scale,
             generator=generator
         ).images[0]
 
-        # 5. Compositing
+        # Compositing
         if image_url:
             print("🔧 Stage 3: Compositing...")
             final_image = Image.composite(style_image, processing_image, mask_blurred)
         else:
             final_image = style_image
 
-        # 🔥 ВОЗВРАЩАЕМ ВСЕ ЭТАПЫ 🔥
         return {
             "status": "success",
             "images": {

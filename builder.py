@@ -12,21 +12,24 @@ def download_file(url, destination):
     print("Download complete.")
 
 def build():
-    # 1. ClipSeg (Для создания масок)
+    # 1. ClipSeg (Маски)
     print("Downloading ClipSeg model...")
     snapshot_download(repo_id="CIDAS/clipseg-rd64-refined")
 
-    # 2. (УДАЛЕНО) Официальная модель Inpainting больше не нужна, 
-    # так как мы используем Juggernaut как базу.
+    # 2. 🔥 ВЕРНУЛИ: Официальная SDXL Inpainting (БАЗА)
+    # Она критически нужна для правильной работы масок
+    print("Downloading Official SDXL Inpainting Model...")
+    snapshot_download(
+        repo_id="diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
+        allow_patterns=["*.fp16.safetensors", "*.json", "*.txt"]
+    )
 
-    # Создаем папку для чекпоинтов
+    # Создаем папку
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # 3. 🔥 Juggernaut XL v9 (Основная модель)
+    # 3. Juggernaut XL v9 (Стиль)
     checkpoint_path = os.path.join(checkpoint_dir, "JuggernautXL_v9.safetensors")
-    
-    # Ссылка на CivitAI (с токеном)
     model_url = "https://civitai.com/api/download/models/348913?token=be68b983e1cd67210cc903389e929cc0"
     
     if not os.path.exists(checkpoint_path):
@@ -35,15 +38,13 @@ def build():
     else:
         print(f"Checkpoint already exists at {checkpoint_path}")
 
-    # 4. Add Detail LoRA (Детализация)
+    # 4. Add Detail LoRA
     lora_path = os.path.join(checkpoint_dir, "add-detail-xl.safetensors")
     lora_url = "https://civitai.com/api/download/models/135867?type=Model&format=SafeTensor"
     
     if not os.path.exists(lora_path):
         print("Downloading Detail LoRA...")
         download_file(lora_url, lora_path)
-    else:
-        print(f"LoRA already exists at {lora_path}")
 
 if __name__ == "__main__":
     build()
