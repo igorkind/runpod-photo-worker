@@ -12,38 +12,32 @@ def download_file(url, destination):
     print("Download complete.")
 
 def build():
-    # 1. ClipSeg (Маски)
-    print("Downloading ClipSeg model...")
+    # 1. ClipSeg
+    print("Downloading ClipSeg...")
     snapshot_download(repo_id="CIDAS/clipseg-rd64-refined")
 
-    # 2. 🔥 ВЕРНУЛИ: Официальная SDXL Inpainting (БАЗА)
-    # Она критически нужна для правильной работы масок
-    print("Downloading Official SDXL Inpainting Model...")
+    # 2. Base Inpainting (Официальная база - оставляем, она лучшая для масок)
+    print("Downloading Base Inpainting...")
     snapshot_download(
         repo_id="diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
         allow_patterns=["*.fp16.safetensors", "*.json", "*.txt"]
     )
 
-    # Создаем папку
-    checkpoint_dir = "checkpoints"
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs("checkpoints", exist_ok=True)
 
-    # 3. Juggernaut XL v9 (Стиль)
-    checkpoint_path = os.path.join(checkpoint_dir, "JuggernautXL_v9.safetensors")
-    model_url = "https://civitai.com/api/download/models/348913?token=be68b983e1cd67210cc903389e929cc0"
+    # 3. 🔥 Big Love XL v4 (Вместо Juggernaut)
+    checkpoint_path = "checkpoints/BigLoveXL_v4.safetensors"
+    # Ваша ссылка на XL4
+    model_url = "https://civitai.com/api/download/models/1990969?token=be68b983e1cd67210cc903389e929cc0"
     
     if not os.path.exists(checkpoint_path):
-        print("Downloading Juggernaut XL...")
+        print("Downloading Big Love XL v4...")
         download_file(model_url, checkpoint_path)
-    else:
-        print(f"Checkpoint already exists at {checkpoint_path}")
 
-    # 4. Add Detail LoRA
-    lora_path = os.path.join(checkpoint_dir, "add-detail-xl.safetensors")
+    # 4. Detail LoRA (Оставляем, она универсальная)
+    lora_path = "checkpoints/add-detail-xl.safetensors"
     lora_url = "https://civitai.com/api/download/models/135867?type=Model&format=SafeTensor"
-    
     if not os.path.exists(lora_path):
-        print("Downloading Detail LoRA...")
         download_file(lora_url, lora_path)
 
 if __name__ == "__main__":

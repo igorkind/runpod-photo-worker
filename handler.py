@@ -10,7 +10,7 @@ import traceback
 import diffusers
 import transformers
 
-print(f"DEBUG: Script v3.9 (Fix: Mask Brightness Level). Diffusers: {diffusers.__version__}", file=sys.stderr)
+print(f"DEBUG: Script v4.0 (Big Love XL). Diffusers: {diffusers.__version__}", file=sys.stderr)
 
 from PIL import Image, ImageFilter
 from diffusers import StableDiffusionXLInpaintPipeline, StableDiffusionXLImg2ImgPipeline, DPMSolverMultistepScheduler
@@ -21,7 +21,7 @@ pipe_base = None
 pipe_style = None
 processor = None
 segmentator = None
-CHECKPOINT_FILE = "JuggernautXL_v9.safetensors"
+CHECKPOINT_FILE = "BigLoveXL_v4.safetensors"
 
 def init_handler():
     global pipe_base, pipe_style, processor, segmentator
@@ -48,7 +48,7 @@ def init_handler():
             pipe_base.scheduler.config, use_karras_sigmas=True, algorithm_type="sde-dpmsolver++"
         )
 
-        # 3. Refiner (Juggernaut)
+        # 3. Refiner (Big Love XL)
         print(f"Loading Refiner ({CHECKPOINT_FILE})...")
         checkpoint_path = f"./checkpoints/{CHECKPOINT_FILE}"
         
