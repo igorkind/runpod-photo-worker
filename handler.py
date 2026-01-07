@@ -10,9 +10,9 @@ import traceback
 import diffusers
 import transformers
 
-print(f"DEBUG: Script v2.5 (Juggernaut Ready + Mask Debug). Diffusers: {diffusers.__version__}", file=sys.stderr)
+print(f"DEBUG: Script v3.0 (Juggernaut + Fix Mask). Diffusers: {diffusers.__version__}", file=sys.stderr)
 
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageFilter
 from diffusers import StableDiffusionXLInpaintPipeline, StableDiffusionXLImg2ImgPipeline, DPMSolverMultistepScheduler
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 
@@ -22,9 +22,8 @@ pipe_style = None
 processor = None
 segmentator = None
 
-# Имя файла чекпоинта (должно совпадать с тем, что качает builder.py)
-# Если используете Juggernaut, поменяйте имя здесь!
-CHECKPOINT_NAME = "Biglove2.safetensors" 
+# Имя модели (должно совпадать с builder.py)
+CHECKPOINT_FILE = "JuggernautXL_v9.safetensors"
 
 def init_handler():
     global pipe_base, pipe_style, processor, segmentator
@@ -44,20 +43,20 @@ def init_handler():
             torch_dtype=torch.float16,
             variant="fp16",
             use_safetensors=True,
-            safety_checker=None,
+            safety_checker=None, 
             requires_safety_checker=False
         ).to(device)
         
-        # DPM++ 2M SDE Karras (Лучший для реализма)
+        # DPM++ 2M SDE Karras
         pipe_base.scheduler = DPMSolverMultistepScheduler.from_config(
             pipe_base.scheduler.config, 
             use_karras_sigmas=True,
             algorithm_type="sde-dpmsolver++"
         )
 
-        # 3. Style Model (Juggernaut / BigLove)
-        print(f"Loading Style Model ({CHECKPOINT_NAME})...")
-        checkpoint_path = f"./checkpoints/{CHECKPOINT_NAME}"
+        # 3. Juggernaut XL (Style)
+        print(f"Loading Style Model ({CHECKPOINT_FILE})...")
+        checkpoint_path = f"./checkpoints/{CHECKPOINT_FILE}"
         
         pipe_style = StableDiffusionXLImg2ImgPipeline.from_single_file(
             checkpoint_path,
@@ -81,8 +80,9 @@ def init_handler():
         # 4. LoRA
         lora_path = "./checkpoints/add-detail-xl.safetensors"
         try:
+            print("Loading Detail LoRA...")
             pipe_style.load_lora_weights(lora_path)
-            pipe_style.fuse_lora(lora_scale=0.5) # 0.5 - безопасно для кожи
+            pipe_style.fuse_lora(lora_scale=0.5)
             print("✅ LoRA fused.")
         except Exception:
             print("⚠️ LoRA skipped.")
@@ -112,14 +112,14 @@ def smart_resize(image, target_size=1024):
 def get_mask_advanced(image, include_prompts, exclude_prompts):
     device = segmentator.device
     
-    # Расширяем список одежды, чтобы точно поймать всё
+    # Расширяем список одежды автоматически
     if "clothes" in include_prompts:
-        include_prompts += ", fabric, texture, garment"
+        include_prompts += ", fabric, texture, garment, outfit"
         
     targets = [p.strip() for p in include_prompts.split(",")]
     anti_targets = [p.strip() for p in exclude_prompts.split(",")] if exclude_prompts else []
-    all_prompts = targets + anti_targets
     
+    all_prompts = targets + anti_targets
     inputs = processor(text=all_prompts, images=[image] * len(all_prompts), padding="max_length", return_tensors="pt").to(device)
     
     with torch.no_grad():
@@ -127,21 +127,18 @@ def get_mask_advanced(image, include_prompts, exclude_prompts):
     
     preds = outputs.logits.unsqueeze(1)
     
-    # 1. Маска включения (Одежда)
+    # 1. ВКЛЮЧАЕМ (Одежда)
     mask_include = torch.sigmoid(preds[0][0])
     for i in range(1, len(targets)):
         mask_include = torch.max(mask_include, torch.sigmoid(preds[i][0]))
         
-    # 2. Маска исключения (Лицо/Руки)
+    # 2. ИСКЛЮЧАЕМ (Только лицо и руки, кожу НЕ трогаем)
     if anti_targets:
         mask_exclude = torch.sigmoid(preds[len(targets)][0])
         for i in range(len(targets) + 1, len(all_prompts)):
             mask_exclude = torch.max(mask_exclude, torch.sigmoid(preds[i][0]))
         
-        # БЕЗОПАСНОЕ ВЫЧИТАНИЕ:
-        # Мы не вычитаем, а умножаем на инверсию. Это мягче.
-        # Если mask_exclude = 1 (лицо), то (1 - mask_exclude) = 0.
-        # mask_include * 0 = 0 (убираем одежду с лица).
+        # Мягкое вычитание
         inverted_exclude = 1.0 - mask_exclude
         final_mask_tensor = mask_include * inverted_exclude
     else:
@@ -150,11 +147,11 @@ def get_mask_advanced(image, include_prompts, exclude_prompts):
     mask_np = final_mask_tensor.cpu().numpy()
     mask_cv = cv2.resize(mask_np, image.size, interpolation=cv2.INTER_CUBIC)
     
-    # Понижаем порог до 0.15, чтобы захватить даже темную одежду
-    _, binary_mask = cv2.threshold(mask_cv, 0.15, 255, cv2.THRESH_BINARY)
+    # Порог 0.2 (лояльный)
+    _, binary_mask = cv2.threshold(mask_cv, 0.2, 255, cv2.THRESH_BINARY)
     
-    # Расширяем маску (Dilate), чтобы перекрыть старые швы
-    kernel = np.ones((20, 20), np.uint8) # Увеличили ядро
+    # Расширяем маску (Dilate), чтобы точно перекрыть старую одежду
+    kernel = np.ones((20, 20), np.uint8) 
     dilated_mask = cv2.dilate(binary_mask.astype(np.uint8), kernel, iterations=1)
     
     return Image.fromarray(dilated_mask * 255)
@@ -174,10 +171,9 @@ def handler(event):
     image_url = job_input.get("image_url")
     user_prompt = job_input.get("prompt")
     
-    # Принудительно улучшаем промпт
-    prompt = f"professional photo, award winning photography, 8k, highly detailed, realistic texture, {user_prompt}, soft lighting, sharp focus"
-    
-    negative_prompt = job_input.get("negative_prompt", "cartoon, painting, illustration, low quality, blurry, distorted face, bad hands, ugly, nsfw, watermark, text")
+    # Промпт для Juggernaut
+    prompt = f"photograph, realistic, 8k, highly detailed, {user_prompt}, soft lighting, sharp focus, f/1.8"
+    negative_prompt = job_input.get("negative_prompt", "drawing, cartoon, illustration, low quality, blurry, distorted face, bad hands, ugly, watermark, text")
     
     if not user_prompt:
         return {"status": "failed", "error": "Missing prompt"}
@@ -204,31 +200,26 @@ def handler(event):
             original_image = download_image(image_url)
             processing_image = smart_resize(original_image, target_size=1024)
             
-            # Обновленные цели для ClipSeg (более точные)
-            mask_target = "clothes, dress, suit, tshirt, outfit, jacket, coat, shirt, top, blouse"
-            mask_exclude = "face, head, hands, skin"
+            # 🔥 ИСПРАВЛЕНИЕ: Убрали 'skin' и 'hair', оставили только критическое
+            mask_target = job_input.get("mask_target", "clothes, dress, suit, tshirt, outfit, jacket, coat")
+            mask_exclude = "face, head, hands" 
             
-            print(f"🎭 Generating mask...")
+            print(f"🎭 Generating mask (Target: {mask_target} | Exclude: {mask_exclude})")
             mask_image = get_mask_advanced(processing_image, mask_target, mask_exclude)
             
-            # --- DEBUG: ПРОВЕРКА МАСКИ ---
-            # Если маска пустая (черная), значит ClipSeg не нашел одежду.
-            # В таком случае мы вернем ошибку или саму маску, чтобы вы поняли причину.
-            if mask_image.getbbox() is None:
-                print("⚠️ WARNING: Empty mask! ClipSeg failed to find clothes.")
-                # Фолбэк: пробуем закрасить всё, кроме лица (грубый метод)
-                # Или просто возвращаем маску для отладки (раскомментируйте для теста)
-                # buffered = io.BytesIO()
-                # mask_image.save(buffered, format="JPEG")
-                # return {"status": "success", "image": base64.b64encode(buffered.getvalue()).decode("utf-8")}
-                
-                # Реальный фолбэк: рисуем везде
-                mask_image = Image.new("L", processing_image.size, 255)
-
-            mask_blurred = mask_image.filter(ImageFilter.GaussianBlur(radius=20)) # Сильное размытие для мягкости
+            # Защита от пустой маски
+            bbox = mask_image.getbbox()
+            if bbox is None:
+                print("⚠️ WARNING: Mask is empty! Using Fallback (Full image minus Face).")
+                # Фолбэк: берем все, кроме лица
+                mask_image = get_mask_advanced(processing_image, "person, body", "face")
+            
+            mask_blurred = mask_image.filter(ImageFilter.GaussianBlur(radius=15))
 
         # 1. Base Structure
         print("🔹 Stage 1: Base Inpainting...")
+        strength_val = 1.0 if is_t2i else 0.99
+        
         inpainted_image = pipe_base(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -237,20 +228,20 @@ def handler(event):
             height=processing_image.height,
             width=processing_image.width,
             num_inference_steps=25,
-            guidance_scale=5.0,
-            strength=0.99 if not is_t2i else 1.0,
+            guidance_scale=6.0, # Немного выше для Juggernaut
+            strength=strength_val,
             generator=generator
         ).images[0]
         
-        # 2. Refiner (Style)
+        # 2. Refiner (Juggernaut)
         print("🔸 Stage 2: Style Refiner...")
         style_image = pipe_style(
             prompt=prompt,
             negative_prompt=negative_prompt,
             image=inpainted_image,
-            num_inference_steps=30,
-            strength=0.40, # 40% изменений текстуры
-            guidance_scale=5.0,
+            num_inference_steps=25,
+            strength=0.35, # Аккуратная стилизация
+            guidance_scale=6.0,
             generator=generator
         ).images[0]
 
@@ -259,12 +250,10 @@ def handler(event):
             final_image = style_image
         else:
             print("🔧 Stage 3: Compositing...")
-            # Накладываем результат поверх ОРИГИНАЛА (processing_image), а не inpainted
-            # Это гарантирует, что лицо будет 100% оригинальным
             final_image = Image.composite(style_image, processing_image, mask_blurred)
 
         buffered = io.BytesIO()
-        final_image.save(buffered, format="JPEG", quality=95, subsampling=0)
+        final_image.save(buffered, format="JPEG", quality=98, subsampling=0)
         img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
         
         print(f"✅ Job {job_id} success.")
