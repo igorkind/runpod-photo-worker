@@ -10,7 +10,7 @@ import traceback
 import diffusers
 import transformers
 
-print(f"DEBUG: Script v3.0 (Juggernaut + Fix Mask). Diffusers: {diffusers.__version__}", file=sys.stderr)
+print(f"DEBUG: Script v3.1 (Robust Coverage Check). Diffusers: {diffusers.__version__}", file=sys.stderr)
 
 from PIL import Image, ImageFilter
 from diffusers import StableDiffusionXLInpaintPipeline, StableDiffusionXLImg2ImgPipeline, DPMSolverMultistepScheduler
@@ -23,7 +23,7 @@ processor = None
 segmentator = None
 
 # Имя модели (должно совпадать с builder.py)
-CHECKPOINT_FILE = "JuggernautXL_v9.safetensors"
+CHECKPOINT_FILE = "JuggernautXL_v9.safetensors" 
 
 def init_handler():
     global pipe_base, pipe_style, processor, segmentator
@@ -47,14 +47,13 @@ def init_handler():
             requires_safety_checker=False
         ).to(device)
         
-        # DPM++ 2M SDE Karras
         pipe_base.scheduler = DPMSolverMultistepScheduler.from_config(
             pipe_base.scheduler.config, 
             use_karras_sigmas=True,
             algorithm_type="sde-dpmsolver++"
         )
 
-        # 3. Juggernaut XL (Style)
+        # 3. Style Model
         print(f"Loading Style Model ({CHECKPOINT_FILE})...")
         checkpoint_path = f"./checkpoints/{CHECKPOINT_FILE}"
         
@@ -109,30 +108,22 @@ def smart_resize(image, target_size=1024):
     new_height = (new_height // 8) * 8
     return image.resize((new_width, new_height), Image.LANCZOS)
 
-def get_mask_advanced(image, include_prompts, exclude_prompts):
+def get_mask_tensor(image, targets, anti_targets):
+    """Низкоуровневое получение сырой маски (тензора)"""
     device = segmentator.device
-    
-    # Расширяем список одежды автоматически
-    if "clothes" in include_prompts:
-        include_prompts += ", fabric, texture, garment, outfit"
-        
-    targets = [p.strip() for p in include_prompts.split(",")]
-    anti_targets = [p.strip() for p in exclude_prompts.split(",")] if exclude_prompts else []
-    
     all_prompts = targets + anti_targets
-    inputs = processor(text=all_prompts, images=[image] * len(all_prompts), padding="max_length", return_tensors="pt").to(device)
     
+    inputs = processor(text=all_prompts, images=[image] * len(all_prompts), padding="max_length", return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = segmentator(**inputs)
-    
     preds = outputs.logits.unsqueeze(1)
     
-    # 1. ВКЛЮЧАЕМ (Одежда)
+    # Include
     mask_include = torch.sigmoid(preds[0][0])
     for i in range(1, len(targets)):
         mask_include = torch.max(mask_include, torch.sigmoid(preds[i][0]))
         
-    # 2. ИСКЛЮЧАЕМ (Только лицо и руки, кожу НЕ трогаем)
+    # Exclude
     if anti_targets:
         mask_exclude = torch.sigmoid(preds[len(targets)][0])
         for i in range(len(targets) + 1, len(all_prompts)):
@@ -144,17 +135,26 @@ def get_mask_advanced(image, include_prompts, exclude_prompts):
     else:
         final_mask_tensor = mask_include
 
-    mask_np = final_mask_tensor.cpu().numpy()
-    mask_cv = cv2.resize(mask_np, image.size, interpolation=cv2.INTER_CUBIC)
+    return final_mask_tensor
+
+def process_mask_from_tensor(mask_tensor, image_size):
+    """Превращает тензор в картинку и считает покрытие"""
+    mask_np = mask_tensor.cpu().numpy()
+    mask_cv = cv2.resize(mask_np, image_size, interpolation=cv2.INTER_CUBIC)
     
-    # Порог 0.2 (лояльный)
-    _, binary_mask = cv2.threshold(mask_cv, 0.2, 255, cv2.THRESH_BINARY)
+    # Порог 0.15
+    _, binary_mask = cv2.threshold(mask_cv, 0.15, 255, cv2.THRESH_BINARY)
     
-    # Расширяем маску (Dilate), чтобы точно перекрыть старую одежду
-    kernel = np.ones((20, 20), np.uint8) 
+    # Считаем процент белых пикселей
+    non_zero = cv2.countNonZero(binary_mask)
+    total_pixels = binary_mask.shape[0] * binary_mask.shape[1]
+    coverage = non_zero / total_pixels
+    
+    # Расширяем (Dilate)
+    kernel = np.ones((20, 20), np.uint8)
     dilated_mask = cv2.dilate(binary_mask.astype(np.uint8), kernel, iterations=1)
     
-    return Image.fromarray(dilated_mask * 255)
+    return Image.fromarray(dilated_mask * 255), coverage
 
 def download_image(url):
     response = requests.get(url, timeout=30)
@@ -171,8 +171,7 @@ def handler(event):
     image_url = job_input.get("image_url")
     user_prompt = job_input.get("prompt")
     
-    # Промпт для Juggernaut
-    prompt = f"photograph, realistic, 8k, highly detailed, {user_prompt}, soft lighting, sharp focus, f/1.8"
+    prompt = f"photograph, realistic, 8k, highly detailed, {user_prompt}, soft lighting, sharp focus"
     negative_prompt = job_input.get("negative_prompt", "drawing, cartoon, illustration, low quality, blurry, distorted face, bad hands, ugly, watermark, text")
     
     if not user_prompt:
@@ -200,20 +199,35 @@ def handler(event):
             original_image = download_image(image_url)
             processing_image = smart_resize(original_image, target_size=1024)
             
-            # 🔥 ИСПРАВЛЕНИЕ: Убрали 'skin' и 'hair', оставили только критическое
-            mask_target = job_input.get("mask_target", "clothes, dress, suit, tshirt, outfit, jacket, coat, underwear, swimsuit, hat, underpants")
-            mask_exclude = "face, head, hands" 
+            # --- СТРАТЕГИЯ МАСКИРОВАНИЯ ---
             
-            print(f"🎭 Generating mask (Target: {mask_target} | Exclude: {mask_exclude})")
-            mask_image = get_mask_advanced(processing_image, mask_target, mask_exclude)
+            # 1. Попытка: Ищем ОДЕЖДУ
+            target_list = ["clothes", "dress", "suit", "tshirt", "outfit", "jacket", "coat", "underwear", "swimsuit", "underpants"]
+            # Исключаем лицо, чтобы его не закрасило
+            exclude_list = ["face", "head", "hands"]
             
-            # Защита от пустой маски
-            bbox = mask_image.getbbox()
-            if bbox is None:
-                print("⚠️ WARNING: Mask is empty! Using Fallback (Full image minus Face).")
-                # Фолбэк: берем все, кроме лица
-                mask_image = get_mask_advanced(processing_image, "person, body", "face")
-            
+            print(f"🎭 Attempt 1: Searching for clothes...")
+            mask_tensor = get_mask_tensor(processing_image, target_list, exclude_list)
+            mask_image, coverage = process_mask_from_tensor(mask_tensor, processing_image.size)
+            print(f"📊 Clothes Coverage: {coverage:.2%}")
+
+            # 2. Попытка: Fallback (Если одежды найдено < 3%)
+            if coverage < 0.03:
+                print("⚠️ Coverage too low! Switching to Fallback (Person - Face)")
+                # Ищем человека целиком
+                target_list = ["person", "woman", "man", "body"]
+                # Исключаем только лицо
+                exclude_list = ["face", "head"]
+                
+                mask_tensor = get_mask_tensor(processing_image, target_list, exclude_list)
+                mask_image, coverage = process_mask_from_tensor(mask_tensor, processing_image.size)
+                print(f"📊 Fallback Coverage: {coverage:.2%}")
+                
+            # 3. Аварийная: Если и человека не нашли (или он весь закрыт лицом?)
+            if coverage < 0.01:
+                print("🚨 FATAL: No subject found. Using Full Image Mask.")
+                mask_image = Image.new("L", processing_image.size, 255)
+
             mask_blurred = mask_image.filter(ImageFilter.GaussianBlur(radius=15))
 
         # 1. Base Structure
@@ -227,20 +241,20 @@ def handler(event):
             mask_image=mask_image, 
             height=processing_image.height,
             width=processing_image.width,
-            num_inference_steps=30,
-            guidance_scale=6.0, # Немного выше для Juggernaut
+            num_inference_steps=25,
+            guidance_scale=6.0,
             strength=strength_val,
             generator=generator
         ).images[0]
         
-        # 2. Refiner (Juggernaut)
+        # 2. Refiner
         print("🔸 Stage 2: Style Refiner...")
         style_image = pipe_style(
             prompt=prompt,
             negative_prompt=negative_prompt,
             image=inpainted_image,
             num_inference_steps=30,
-            strength=0.35, # Аккуратная стилизация
+            strength=0.35,
             guidance_scale=6.0,
             generator=generator
         ).images[0]
