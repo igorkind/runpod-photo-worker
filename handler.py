@@ -10,7 +10,7 @@ import traceback
 import diffusers
 import transformers
 
-print(f"DEBUG: Script v3.8 (Fully Dynamic Config). Diffusers: {diffusers.__version__}", file=sys.stderr)
+print(f"DEBUG: Script v3.9 (Fix: Mask Brightness Level). Diffusers: {diffusers.__version__}", file=sys.stderr)
 
 from PIL import Image, ImageFilter
 from diffusers import StableDiffusionXLInpaintPipeline, StableDiffusionXLImg2ImgPipeline, DPMSolverMultistepScheduler
@@ -123,12 +123,21 @@ def get_mask_tensor(image, targets, anti_targets):
 def process_mask_from_tensor(mask_tensor, image_size):
     mask_np = mask_tensor.cpu().numpy()
     mask_cv = cv2.resize(mask_np, image_size, interpolation=cv2.INTER_CUBIC)
+    
+    # 1. Порог: делаем пиксели либо 0 (черный), либо 255 (белый)
     _, binary_mask = cv2.threshold(mask_cv, 0.15, 255, cv2.THRESH_BINARY)
+    
+    # 2. Считаем покрытие
     non_zero = cv2.countNonZero(binary_mask)
     coverage = non_zero / (binary_mask.shape[0] * binary_mask.shape[1])
+    
+    # 3. Расширяем маску
     kernel = np.ones((20, 20), np.uint8)
     dilated_mask = cv2.dilate(binary_mask.astype(np.uint8), kernel, iterations=1)
-    return Image.fromarray(dilated_mask * 255), coverage
+    
+    # 🔥 ИСПРАВЛЕНИЕ: dilated_mask УЖЕ имеет значения 255. 
+    # Умножать еще раз на 255 НЕЛЬЗЯ (будет переполнение и черный цвет).
+    return Image.fromarray(dilated_mask), coverage
 
 def image_to_base64(image):
     buffered = io.BytesIO()
@@ -151,7 +160,6 @@ def handler(event):
         image_url = job_input.get("image_url")
         user_prompt = job_input.get("prompt", "")
         
-        # Динамические настройки с дефолтами
         mask_target_str = job_input.get("mask_target", "clothes, dress, suit, tshirt, outfit, jacket, coat, underwear, swimsuit, underpants")
         mask_exclude_str = job_input.get("mask_exclude", "face, head, hands")
         mask_blur_radius = int(job_input.get("mask_blur", 15))
@@ -163,14 +171,12 @@ def handler(event):
         
         negative_prompt = job_input.get("negative_prompt", "blurry, low quality, distorted face, ugly hands, cartoon, 3d render")
         
-        # Формируем полный промпт (можно также передать use_raw_prompt=True, если не хотим добавлять суффиксы)
         prompt = f"({user_prompt})++, professional photo, realistic, 8k, highly detailed, soft lighting"
         
         generator = torch.Generator(device="cuda").manual_seed(job_input.get("seed", 42))
         
         # --- 2. ЗАГРУЗКА И МАСКИРОВАНИЕ ---
         if not image_url:
-            # T2I режим
             processing_image = Image.new("RGB", (832, 1216), (0,0,0))
             mask_image = Image.new("L", (832, 1216), 255)
             coverage = 1.0
@@ -188,7 +194,7 @@ def handler(event):
             mask_image, coverage = process_mask_from_tensor(mask_tensor, processing_image.size)
             print(f"📊 Coverage: {coverage:.2%}")
 
-            # Fallback (если маска < 10%)
+            # Fallback
             if coverage < 0.10:
                 print("⚠️ Coverage low (<10%). Switching to Full Body Mask.")
                 mask_tensor = get_mask_tensor(processing_image, ["person", "body"], ["face"])
@@ -200,6 +206,7 @@ def handler(event):
         
         # Stage 1: Base
         print(f"🔹 Stage 1: Steps={steps_base}, CFG={guidance_scale}...")
+        # Для Inpainting strength=1.0 означает полную замену под маской
         inpainted_image = pipe_base(
             prompt=prompt,
             negative_prompt=negative_prompt,
