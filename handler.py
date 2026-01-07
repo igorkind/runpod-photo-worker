@@ -10,9 +10,9 @@ import traceback
 import diffusers
 import transformers
 
-print(f"DEBUG: Script v2.4 (Fix Masking). Diffusers: {diffusers.__version__}", file=sys.stderr)
+print(f"DEBUG: Script v2.5 (Juggernaut Ready + Mask Debug). Diffusers: {diffusers.__version__}", file=sys.stderr)
 
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageOps
 from diffusers import StableDiffusionXLInpaintPipeline, StableDiffusionXLImg2ImgPipeline, DPMSolverMultistepScheduler
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 
@@ -21,6 +21,10 @@ pipe_base = None
 pipe_style = None
 processor = None
 segmentator = None
+
+# Имя файла чекпоинта (должно совпадать с тем, что качает builder.py)
+# Если используете Juggernaut, поменяйте имя здесь!
+CHECKPOINT_NAME = "Biglove2.safetensors" 
 
 def init_handler():
     global pipe_base, pipe_style, processor, segmentator
@@ -44,15 +48,16 @@ def init_handler():
             requires_safety_checker=False
         ).to(device)
         
+        # DPM++ 2M SDE Karras (Лучший для реализма)
         pipe_base.scheduler = DPMSolverMultistepScheduler.from_config(
             pipe_base.scheduler.config, 
             use_karras_sigmas=True,
             algorithm_type="sde-dpmsolver++"
         )
 
-        # 3. Big Love
-        print("Loading Style Model...")
-        checkpoint_path = "./checkpoints/Biglove2.safetensors"
+        # 3. Style Model (Juggernaut / BigLove)
+        print(f"Loading Style Model ({CHECKPOINT_NAME})...")
+        checkpoint_path = f"./checkpoints/{CHECKPOINT_NAME}"
         
         pipe_style = StableDiffusionXLImg2ImgPipeline.from_single_file(
             checkpoint_path,
@@ -76,9 +81,8 @@ def init_handler():
         # 4. LoRA
         lora_path = "./checkpoints/add-detail-xl.safetensors"
         try:
-            print("Loading Detail LoRA...")
             pipe_style.load_lora_weights(lora_path)
-            pipe_style.fuse_lora(lora_scale=0.6)
+            pipe_style.fuse_lora(lora_scale=0.5) # 0.5 - безопасно для кожи
             print("✅ LoRA fused.")
         except Exception:
             print("⚠️ LoRA skipped.")
@@ -108,6 +112,10 @@ def smart_resize(image, target_size=1024):
 def get_mask_advanced(image, include_prompts, exclude_prompts):
     device = segmentator.device
     
+    # Расширяем список одежды, чтобы точно поймать всё
+    if "clothes" in include_prompts:
+        include_prompts += ", fabric, texture, garment"
+        
     targets = [p.strip() for p in include_prompts.split(",")]
     anti_targets = [p.strip() for p in exclude_prompts.split(",")] if exclude_prompts else []
     all_prompts = targets + anti_targets
@@ -119,32 +127,34 @@ def get_mask_advanced(image, include_prompts, exclude_prompts):
     
     preds = outputs.logits.unsqueeze(1)
     
-    # 1. ВКЛЮЧАЕМ (Одежда)
+    # 1. Маска включения (Одежда)
     mask_include = torch.sigmoid(preds[0][0])
     for i in range(1, len(targets)):
         mask_include = torch.max(mask_include, torch.sigmoid(preds[i][0]))
         
-    # 2. ИСКЛЮЧАЕМ (Лицо)
+    # 2. Маска исключения (Лицо/Руки)
     if anti_targets:
         mask_exclude = torch.sigmoid(preds[len(targets)][0])
         for i in range(len(targets) + 1, len(all_prompts)):
             mask_exclude = torch.max(mask_exclude, torch.sigmoid(preds[i][0]))
         
-        # Исправление: Меньший коэффициент вычитания (1.0 вместо 1.5)
-        # Чтобы не стирать одежду, если она рядом с лицом
-        final_mask_tensor = mask_include - (mask_exclude * 1.0)
-        final_mask_tensor = torch.clamp(final_mask_tensor, 0, 1)
+        # БЕЗОПАСНОЕ ВЫЧИТАНИЕ:
+        # Мы не вычитаем, а умножаем на инверсию. Это мягче.
+        # Если mask_exclude = 1 (лицо), то (1 - mask_exclude) = 0.
+        # mask_include * 0 = 0 (убираем одежду с лица).
+        inverted_exclude = 1.0 - mask_exclude
+        final_mask_tensor = mask_include * inverted_exclude
     else:
         final_mask_tensor = mask_include
 
     mask_np = final_mask_tensor.cpu().numpy()
     mask_cv = cv2.resize(mask_np, image.size, interpolation=cv2.INTER_CUBIC)
     
-    # Исправление: Порог 0.2 (был 0.35) - захватит больше одежды
-    _, binary_mask = cv2.threshold(mask_cv, 0.20, 255, cv2.THRESH_BINARY)
+    # Понижаем порог до 0.15, чтобы захватить даже темную одежду
+    _, binary_mask = cv2.threshold(mask_cv, 0.15, 255, cv2.THRESH_BINARY)
     
-    # Dilate: Расширяем маску на 15 пикселей, чтобы перекрыть швы
-    kernel = np.ones((15, 15), np.uint8)
+    # Расширяем маску (Dilate), чтобы перекрыть старые швы
+    kernel = np.ones((20, 20), np.uint8) # Увеличили ядро
     dilated_mask = cv2.dilate(binary_mask.astype(np.uint8), kernel, iterations=1)
     
     return Image.fromarray(dilated_mask * 255)
@@ -162,10 +172,14 @@ def handler(event):
 
     job_input = event["input"]
     image_url = job_input.get("image_url")
-    prompt = job_input.get("prompt")
-    negative_prompt = job_input.get("negative_prompt", "")
+    user_prompt = job_input.get("prompt")
     
-    if not prompt:
+    # Принудительно улучшаем промпт
+    prompt = f"professional photo, award winning photography, 8k, highly detailed, realistic texture, {user_prompt}, soft lighting, sharp focus"
+    
+    negative_prompt = job_input.get("negative_prompt", "cartoon, painting, illustration, low quality, blurry, distorted face, bad hands, ugly, nsfw, watermark, text")
+    
+    if not user_prompt:
         return {"status": "failed", "error": "Missing prompt"}
 
     try:
@@ -190,23 +204,31 @@ def handler(event):
             original_image = download_image(image_url)
             processing_image = smart_resize(original_image, target_size=1024)
             
-            # ИСПРАВЛЕНИЕ: Убрали 'skin' и 'hair' из исключений! Это важно.
-            mask_target = job_input.get("mask_target", "clothes, dress, suit, tshirt, outfit, jacket, coat")
-            mask_exclude = "face, head, hands" 
+            # Обновленные цели для ClipSeg (более точные)
+            mask_target = "clothes, dress, suit, tshirt, outfit, jacket, coat, shirt, top, blouse"
+            mask_exclude = "face, head, hands, skin"
             
             print(f"🎭 Generating mask...")
             mask_image = get_mask_advanced(processing_image, mask_target, mask_exclude)
             
-            # Проверка на пустую маску
+            # --- DEBUG: ПРОВЕРКА МАСКИ ---
+            # Если маска пустая (черная), значит ClipSeg не нашел одежду.
+            # В таком случае мы вернем ошибку или саму маску, чтобы вы поняли причину.
             if mask_image.getbbox() is None:
-                print("⚠️ WARNING: Empty mask detected! Fallback to full image processing.")
+                print("⚠️ WARNING: Empty mask! ClipSeg failed to find clothes.")
+                # Фолбэк: пробуем закрасить всё, кроме лица (грубый метод)
+                # Или просто возвращаем маску для отладки (раскомментируйте для теста)
+                # buffered = io.BytesIO()
+                # mask_image.save(buffered, format="JPEG")
+                # return {"status": "success", "image": base64.b64encode(buffered.getvalue()).decode("utf-8")}
+                
+                # Реальный фолбэк: рисуем везде
                 mask_image = Image.new("L", processing_image.size, 255)
-            
-            mask_blurred = mask_image.filter(ImageFilter.GaussianBlur(radius=15))
 
-        print("🔹 Stage 1: Base Structure...")
-        strength_val = 1.0 if is_t2i else 0.99
-        
+            mask_blurred = mask_image.filter(ImageFilter.GaussianBlur(radius=20)) # Сильное размытие для мягкости
+
+        # 1. Base Structure
+        print("🔹 Stage 1: Base Inpainting...")
         inpainted_image = pipe_base(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -216,30 +238,33 @@ def handler(event):
             width=processing_image.width,
             num_inference_steps=25,
             guidance_scale=5.0,
-            strength=strength_val,
+            strength=0.99 if not is_t2i else 1.0,
             generator=generator
         ).images[0]
         
-        print("🔸 Stage 2: Big Love Styling...")
+        # 2. Refiner (Style)
+        print("🔸 Stage 2: Style Refiner...")
         style_image = pipe_style(
             prompt=prompt,
             negative_prompt=negative_prompt,
             image=inpainted_image,
             num_inference_steps=30,
-            strength=0.45, 
+            strength=0.40, # 40% изменений текстуры
             guidance_scale=5.0,
             generator=generator
         ).images[0]
 
+        # 3. Compositing
         if is_t2i:
             final_image = style_image
         else:
             print("🔧 Stage 3: Compositing...")
-            # ИСПРАВЛЕНИЕ: Используем processing_image (Оригинал) как фон, чтобы вернуть оригинальное лицо
+            # Накладываем результат поверх ОРИГИНАЛА (processing_image), а не inpainted
+            # Это гарантирует, что лицо будет 100% оригинальным
             final_image = Image.composite(style_image, processing_image, mask_blurred)
 
         buffered = io.BytesIO()
-        final_image.save(buffered, format="JPEG", quality=98, subsampling=0)
+        final_image.save(buffered, format="JPEG", quality=95, subsampling=0)
         img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
         
         print(f"✅ Job {job_id} success.")
