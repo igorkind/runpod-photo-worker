@@ -201,7 +201,7 @@ def handler(event):
             processing_image = smart_resize(original_image, target_size=1024)
             
             # 🔥 ИСПРАВЛЕНИЕ: Убрали 'skin' и 'hair', оставили только критическое
-            mask_target = job_input.get("mask_target", "clothes, dress, suit, tshirt, outfit, jacket, coat")
+            mask_target = job_input.get("mask_target", "clothes, dress, suit, tshirt, outfit, jacket, coat, underwear, swimsuit, hat, underpants")
             mask_exclude = "face, head, hands" 
             
             print(f"🎭 Generating mask (Target: {mask_target} | Exclude: {mask_exclude})")
@@ -227,7 +227,7 @@ def handler(event):
             mask_image=mask_image, 
             height=processing_image.height,
             width=processing_image.width,
-            num_inference_steps=25,
+            num_inference_steps=30,
             guidance_scale=6.0, # Немного выше для Juggernaut
             strength=strength_val,
             generator=generator
@@ -239,7 +239,7 @@ def handler(event):
             prompt=prompt,
             negative_prompt=negative_prompt,
             image=inpainted_image,
-            num_inference_steps=25,
+            num_inference_steps=30,
             strength=0.35, # Аккуратная стилизация
             guidance_scale=6.0,
             generator=generator
